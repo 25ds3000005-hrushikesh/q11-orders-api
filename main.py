@@ -8,15 +8,21 @@ from threading import Lock
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 
 app = FastAPI(title="Q11 Orders API")
 
-# CORS: allow the assignment page to call this API from a browser.
+# Allow the IIT Madras assignment grader to access the API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://exam.sanand.workers.dev",
+        "https://q11-orders-api.vercel.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:9000",
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,14 +39,13 @@ data_lock = Lock()
 
 
 class OrderRequest(BaseModel):
-    # Optional order details; the endpoint also accepts an empty JSON object.
     item: str = "default item"
     quantity: int = 1
 
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Do not count browser CORS preflight requests.
+    # CORS preflight requests must not consume the rate limit.
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -53,7 +58,6 @@ async def rate_limit_middleware(request: Request, call_next):
     with data_lock:
         times = request_times[client_id]
 
-        # Keep only requests from the last 10 seconds.
         while times and now - times[0] >= WINDOW_SECONDS:
             times.popleft()
 
@@ -61,14 +65,12 @@ async def rate_limit_middleware(request: Request, call_next):
             retry_after = max(
                 1, math.ceil(WINDOW_SECONDS - (now - times[0]))
             )
-            from fastapi.responses import JSONResponse
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
                 headers={"Retry-After": str(retry_after)},
             )
 
-        # Count this request.
         times.append(now)
 
     return await call_next(request)
@@ -98,7 +100,6 @@ def create_order(
         )
 
     with data_lock:
-        # Reuse the original order for a repeated key.
         if idempotency_key in idempotency_store:
             return idempotency_store[idempotency_key]
 
@@ -120,7 +121,9 @@ def encode_cursor(offset: int) -> str:
 def decode_cursor(cursor: str) -> int:
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
-        offset = int(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        offset = int(
+            base64.urlsafe_b64decode(padded).decode("utf-8")
+        )
         if offset < 0 or offset > TOTAL_ORDERS:
             raise ValueError
         return offset
@@ -134,9 +137,8 @@ def list_orders(
     cursor: str | None = Query(default=None),
 ):
     offset = decode_cursor(cursor) if cursor else 0
-
-    # Fixed catalog: IDs 1 through 42, each exactly once across pages.
     end = min(offset + limit, TOTAL_ORDERS)
+
     items = [
         {"id": order_id}
         for order_id in range(offset + 1, end + 1)
